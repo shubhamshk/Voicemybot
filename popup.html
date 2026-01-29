@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Janitor Voice</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 320px;
+      min-height: 200px;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica', 'Arial', sans-serif;
+      color: #fff;
+      padding: 20px;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+
+    .logo {
+      font-size: 48px;
+      margin-bottom: 8px;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.1); }
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .version {
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.5);
+    }
+
+    .content {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .info-box {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    .info-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #667eea;
+    }
+
+    .info-text {
+      font-size: 12px;
+      line-height: 1.6;
+      color: rgba(255, 255, 255, 0.8);
+    }
+
+    .shortcuts {
+      list-style: none;
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    .shortcuts li {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+    }
+
+    .key {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      color: #667eea;
+    }
+
+    .status {
+      text-align: center;
+      padding: 12px;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 8px;
+      color: #10b981;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .links {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .btn {
+      flex: 1;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+      text-align: center;
+    }
+
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.15);
+      transform: translateY(-1px);
+    }
+
+    .footer {
+      margin-top: 16px;
+      text-align: center;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.4);
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">🎤</div>
+    <h1>Janitor Voice</h1>
+    <div class="version">v1.0.0</div>
+  </div>
+
+  <div class="content">
+    <div class="info-box">
+      <div class="info-title">How to Use</div>
+      <div class="info-text">
+        1. Open <strong>Janitor AI</strong><br>
+        2. Click the <strong>🎤 Enable Voice</strong> button in the floating panel<br>
+        3. Character messages will be spoken automatically
+      </div>
+    </div>
+
+    <div class="info-box">
+      <div class="info-title">Keyboard Shortcuts</div>
+      <ul class="shortcuts">
+        <li>
+          <span>Toggle Voice</span>
+          <span class="key">Ctrl+Shift+V</span>
+        </li>
+      </ul>
+    </div>
+
+    <div class="status" id="status">
+      ✓ Extension Active
+    </div>
+
+    <div class="links">
+      <a href="https://janitorai.com" target="_blank" class="btn">Open Janitor AI</a>
+    </div>
+  </div>
+
+  <div class="footer">
+    Made with ❤️ for Janitor AI users
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

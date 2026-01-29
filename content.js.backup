@@ -1,0 +1,1068 @@
+/**
+ * Janitor Voice - Content Script
+ * Production-quality Text-to-Speech for Janitor AI
+ * 
+ * Architecture:
+ * - TTSEngine: Abstract interface for TTS providers
+ * - WebSpeechTTS: Web Speech API implementation
+ * - MessageDetector: MutationObserver-based message detection
+ * - VoiceController: Main orchestrator
+ * - UIPanel: Draggable control panel
+ */
+
+'use strict';
+
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
+
+const CONFIG = {
+  // Storage keys
+  STORAGE_PREFIX: 'janitor_voice_',
+
+  // Default settings
+  DEFAULTS: {
+    enabled: false,
+    rate: 1.0,
+    pitch: 1.0,
+    voiceURI: null,
+    volume: 1.0
+  },
+
+  // Selectors for Janitor AI (may need adjustment based on site updates)
+  SELECTORS: {
+    chatContainer: '[class*="chat"], [class*="message"], #chat-container, main',
+    characterMessage: '[class*="character"], [class*="assistant"], [class*="ai-message"]',
+    userMessage: '[class*="user"], [class*="human"]'
+  },
+
+  // UI settings
+  UI: {
+    panelId: 'janitor-voice-panel',
+    minWidth: 300,
+    minHeight: 200
+  },
+
+  // Speech settings
+  SPEECH: {
+    queueDelay: 500, // ms between queued messages
+    maxQueueSize: 10
+  }
+};
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Storage manager for settings persistence
+ */
+const StorageManager = {
+  /**
+   * Get a setting from localStorage
+   */
+  get(key, defaultValue = null) {
+    try {
+      const stored = localStorage.getItem(CONFIG.STORAGE_PREFIX + key);
+      return stored !== null ? JSON.parse(stored) : defaultValue;
+    } catch (error) {
+      console.error('[Janitor Voice] Storage get error:', error);
+      return defaultValue;
+    }
+  },
+
+  /**
+   * Set a setting in localStorage
+   */
+  set(key, value) {
+    try {
+      localStorage.setItem(CONFIG.STORAGE_PREFIX + key, JSON.stringify(value));
+      return true;
+    } catch (error) {
+      console.error('[Janitor Voice] Storage set error:', error);
+      return false;
+    }
+  },
+
+  /**
+   * Load all settings
+   */
+  loadSettings() {
+    return {
+      enabled: this.get('enabled', CONFIG.DEFAULTS.enabled),
+      rate: this.get('rate', CONFIG.DEFAULTS.rate),
+      pitch: this.get('pitch', CONFIG.DEFAULTS.pitch),
+      voiceURI: this.get('voiceURI', CONFIG.DEFAULTS.voiceURI),
+      volume: this.get('volume', CONFIG.DEFAULTS.volume)
+    };
+  },
+
+  /**
+   * Save all settings
+   */
+  saveSettings(settings) {
+    Object.keys(settings).forEach(key => {
+      this.set(key, settings[key]);
+    });
+  }
+};
+
+// ============================================================================
+// TTS ENGINE ABSTRACTION
+// ============================================================================
+
+/**
+ * Abstract TTS Engine Interface
+ * This allows future swapping to ElevenLabs, PlayHT, Azure TTS, etc.
+ */
+class TTSEngine {
+  constructor() {
+    if (new.target === TTSEngine) {
+      throw new TypeError('Cannot construct TTSEngine instances directly');
+    }
+  }
+
+  /**
+   * Initialize the TTS engine
+   * @returns {Promise<boolean>} Success status
+   */
+  async initialize() {
+    throw new Error('Method initialize() must be implemented');
+  }
+
+  /**
+   * Speak text
+   * @param {string} text - Text to speak
+   * @param {Object} options - Voice options (rate, pitch, voice, etc.)
+   * @returns {Promise<void>}
+   */
+  async speak(text, options = {}) {
+    throw new Error('Method speak() must be implemented');
+  }
+
+  /**
+   * Stop current speech
+   */
+  stop() {
+    throw new Error('Method stop() must be implemented');
+  }
+
+  /**
+   * Pause current speech
+   */
+  pause() {
+    throw new Error('Method pause() must be implemented');
+  }
+
+  /**
+   * Resume paused speech
+   */
+  resume() {
+    throw new Error('Method resume() must be implemented');
+  }
+
+  /**
+   * Check if currently speaking
+   * @returns {boolean}
+   */
+  isSpeaking() {
+    throw new Error('Method isSpeaking() must be implemented');
+  }
+
+  /**
+   * Get available voices
+   * @returns {Array} List of available voices
+   */
+  getVoices() {
+    throw new Error('Method getVoices() must be implemented');
+  }
+}
+
+// ============================================================================
+// WEB SPEECH API IMPLEMENTATION
+// ============================================================================
+
+/**
+ * Web Speech API TTS Implementation
+ */
+class WebSpeechTTS extends TTSEngine {
+  constructor() {
+    super();
+    this.synth = window.speechSynthesis;
+    this.voices = [];
+    this.currentUtterance = null;
+    this.queue = [];
+    this.isProcessingQueue = false;
+  }
+
+  /**
+   * Initialize and load voices
+   * BUG FIX: Proper async voice loading with event handlers
+   */
+  async initialize() {
+    return new Promise((resolve) => {
+      // Voice loading handler
+      const loadVoices = () => {
+        this.voices = this.synth.getVoices();
+        console.log('[Janitor Voice] Loading voices... found:', this.voices.length);
+
+        if (this.voices.length > 0) {
+          console.log('[Janitor Voice] ✓ Loaded', this.voices.length, 'voices successfully');
+          console.log('[Janitor Voice] Available voices:', this.voices.map(v => v.name).join(', '));
+
+          // Remove event listener after successful load
+          this.synth.onvoiceschanged = null;
+          resolve(true);
+        }
+      };
+
+      // Try loading voices immediately
+      loadVoices();
+
+      // BUG FIX: Voices often load asynchronously - set up event listener
+      // This is crucial for Chrome/Edge where voices load after page load
+      if (this.voices.length === 0) {
+        console.log('[Janitor Voice] Voices not ready, waiting for voiceschanged event...');
+        this.synth.onvoiceschanged = () => {
+          console.log('[Janitor Voice] voiceschanged event fired');
+          loadVoices();
+        };
+      }
+
+      // Fallback timeout with proper handling
+      setTimeout(() => {
+        if (this.voices.length === 0) {
+          console.warn('[Janitor Voice] ⚠ No voices loaded after 2s, will use browser default');
+          console.warn('[Janitor Voice] This may cause silent speech failures');
+        }
+        // Always resolve to allow extension to continue
+        resolve(true);
+      }, 2000); // Increased timeout for slower systems
+    });
+  }
+
+  /**
+   * Refresh voices list
+   * BUG FIX: Call this before speaking if no voices are loaded
+   */
+  refreshVoices() {
+    const newVoices = this.synth.getVoices();
+    if (newVoices.length > this.voices.length) {
+      this.voices = newVoices;
+      console.log('[Janitor Voice] Refreshed voices, now have:', this.voices.length);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Speak text with options
+   */
+  async speak(text, options = {}) {
+    if (!text || text.trim().length === 0) {
+      return;
+    }
+
+    // Add to queue
+    this.queue.push({ text, options });
+
+    // Process queue if not already processing
+    if (!this.isProcessingQueue) {
+      this.processQueue();
+    }
+  }
+
+  /**
+   * Process speech queue
+   */
+  async processQueue() {
+    if (this.queue.length === 0) {
+      this.isProcessingQueue = false;
+      return;
+    }
+
+    this.isProcessingQueue = true;
+    const { text, options } = this.queue.shift();
+
+    await this.speakSingle(text, options);
+
+    // Delay before next item
+    setTimeout(() => {
+      this.processQueue();
+    }, CONFIG.SPEECH.queueDelay);
+  }
+
+  /**
+   * Speak a single utterance
+   */
+  speakSingle(text, options) {
+    return new Promise((resolve, reject) => {
+      // Cancel any existing speech
+      this.synth.cancel();
+
+      // Create utterance
+      const utterance = new SpeechSynthesisUtterance(text);
+
+      // Apply options
+      utterance.rate = options.rate || 1.0;
+      utterance.pitch = options.pitch || 1.0;
+      utterance.volume = options.volume || 1.0;
+
+      // Set voice if specified
+      if (options.voiceURI) {
+        const voice = this.voices.find(v => v.voiceURI === options.voiceURI);
+        if (voice) {
+          utterance.voice = voice;
+        }
+      }
+
+      // Event handlers
+      utterance.onend = () => {
+        this.currentUtterance = null;
+        resolve();
+      };
+
+      utterance.onerror = (event) => {
+        console.error('[Janitor Voice] Speech error:', event);
+        this.currentUtterance = null;
+        resolve(); // Resolve anyway to continue queue
+      };
+
+      // Speak
+      this.currentUtterance = utterance;
+      this.synth.speak(utterance);
+    });
+  }
+
+  /**
+   * Stop all speech and clear queue
+   */
+  stop() {
+    this.synth.cancel();
+    this.queue = [];
+    this.currentUtterance = null;
+    this.isProcessingQueue = false;
+  }
+
+  /**
+   * Pause current speech
+   */
+  pause() {
+    if (this.synth.speaking) {
+      this.synth.pause();
+    }
+  }
+
+  /**
+   * Resume paused speech
+   */
+  resume() {
+    if (this.synth.paused) {
+      this.synth.resume();
+    }
+  }
+
+  /**
+   * Check if speaking
+   */
+  isSpeaking() {
+    return this.synth.speaking;
+  }
+
+  /**
+   * Get available voices
+   */
+  getVoices() {
+    return this.voices;
+  }
+}
+
+// ============================================================================
+// MESSAGE DETECTION
+// ============================================================================
+
+/**
+ * Message detector using MutationObserver
+ */
+class MessageDetector {
+  constructor(onNewMessage, onInjectButton) {
+    this.onNewMessage = onNewMessage;
+    this.onInjectButton = onInjectButton;  // NEW: Callback for mic button injection
+    this.observer = null;
+    this.processedMessages = new WeakSet();
+    this.processedButtonInjections = new WeakSet();  // NEW: Track button injections
+    this.chatContainer = null;
+  }
+
+  /**
+   * Start observing for new messages
+   */
+  start() {
+    // Find chat container
+    this.findChatContainer();
+
+    if (!this.chatContainer) {
+      console.warn('[Janitor Voice] Chat container not found, retrying...');
+      setTimeout(() => this.start(), 2000);
+      return;
+    }
+
+    console.log('[Janitor Voice] Observing chat container:', this.chatContainer);
+
+    // Create observer
+    this.observer = new MutationObserver((mutations) => {
+      this.handleMutations(mutations);
+    });
+
+    // Start observing
+    this.observer.observe(this.chatContainer, {
+      childList: true,
+      subtree: true,
+      characterData: false,
+      attributes: false
+    });
+  }
+
+  /**
+   * Stop observing
+   */
+  stop() {
+    if (this.observer) {
+      this.observer.disconnect();
+      this.observer = null;
+    }
+  }
+
+  /**
+   * Find the chat container element
+   */
+  findChatContainer() {
+    // Try multiple selectors
+    const selectors = [
+      CONFIG.SELECTORS.chatContainer,
+      '[role="main"]',
+      'main',
+      '#__next',
+      'body'
+    ];
+
+    for (const selector of selectors) {
+      const elements = selector.split(', ');
+      for (const el of elements) {
+        const container = document.querySelector(el);
+        if (container) {
+          this.chatContainer = container;
+          return;
+        }
+      }
+    }
+  }
+
+  /**
+   * Handle DOM mutations
+   */
+  handleMutations(mutations) {
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList') {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            this.checkForCharacterMessage(node);
+          }
+        });
+      }
+    }
+  }
+
+  /**
+   * Check if a node is a character message
+   */
+  checkForCharacterMessage(element) {
+    // Skip if already processed
+    if (this.processedMessages.has(element)) {
+      return;
+    }
+
+    // Check if this is a character message
+    if (this.isCharacterMessage(element)) {
+      this.processedMessages.add(element);
+      const text = this.extractMessageText(element);
+      if (text && text.trim().length > 0) {
+        console.log('[Janitor Voice] New character message:', text.substring(0, 50) + '...');
+        this.onNewMessage(text);
+      }
+    }
+
+    // Recursively check children
+    element.querySelectorAll('*').forEach(child => {
+      if (this.isCharacterMessage(child) && !this.processedMessages.has(child)) {
+        this.processedMessages.add(child);
+        const text = this.extractMessageText(child);
+        if (text && text.trim().length > 0) {
+          console.log('[Janitor Voice] New character message:', text.substring(0, 50) + '...');
+          this.onNewMessage(text);
+        }
+      }
+    });
+  }
+
+  /**
+   * Check if element is a character message
+   */
+  isCharacterMessage(element) {
+    // This is a heuristic approach - may need adjustment for Janitor AI's specific structure
+    const className = element.className || '';
+    const classList = typeof className === 'string' ? className.toLowerCase() : '';
+
+    // Check for character/AI indicators
+    const isCharacter = classList.includes('character') ||
+      classList.includes('assistant') ||
+      classList.includes('ai') ||
+      classList.includes('bot');
+
+    // Check it's not a user message
+    const isUser = classList.includes('user') ||
+      classList.includes('human');
+
+    // Must have text content
+    const hasText = element.textContent && element.textContent.trim().length > 0;
+
+    return isCharacter && !isUser && hasText;
+  }
+
+  /**
+   * Extract clean text from message element
+   */
+  extractMessageText(element) {
+    // Clone to avoid modifying DOM
+    const clone = element.cloneNode(true);
+
+    // Remove buttons, scripts, styles
+    clone.querySelectorAll('button, script, style, img').forEach(el => el.remove());
+
+    // Get text
+    let text = clone.textContent || '';
+
+    // Clean up
+    text = text.trim();
+    text = text.replace(/\s+/g, ' '); // Normalize whitespace
+
+    return text;
+  }
+}
+
+// ============================================================================
+// UI PANEL
+// ============================================================================
+
+/**
+ * Draggable control panel UI
+ */
+class UIPanel {
+  constructor(controller) {
+    this.controller = controller;
+    this.panel = null;
+    this.isDragging = false;
+    this.dragOffset = { x: 0, y: 0 };
+    this.isMinimized = false;
+  }
+
+  /**
+   * Create and inject the panel
+   */
+  create() {
+    // Create panel element
+    this.panel = document.createElement('div');
+    this.panel.id = CONFIG.UI.panelId;
+    this.panel.className = 'janitor-voice-panel';
+
+    // Build panel HTML
+    this.panel.innerHTML = `
+      <div class="jv-header" id="jv-drag-handle">
+        <div class="jv-title">
+          <span class="jv-icon">🎤</span>
+          <span>Janitor Voice</span>
+        </div>
+        <div class="jv-actions">
+          <button class="jv-btn-minimize" id="jv-minimize" title="Minimize">−</button>
+          <button class="jv-btn-close" id="jv-close" title="Close">×</button>
+        </div>
+      </div>
+      <div class="jv-body" id="jv-body">
+        <div class="jv-control">
+          <label class="jv-toggle-label">
+            <input type="checkbox" id="jv-toggle" />
+            <span class="jv-toggle-slider"></span>
+            <span class="jv-toggle-text">Enable Voice</span>
+          </label>
+        </div>
+        
+        <div class="jv-control">
+          <label class="jv-label">
+            <span>Speech Rate</span>
+            <span class="jv-value" id="jv-rate-value">1.0x</span>
+          </label>
+          <input type="range" id="jv-rate" min="0.5" max="2" step="0.1" value="1" />
+        </div>
+        
+        <div class="jv-control">
+          <label class="jv-label">
+            <span>Pitch</span>
+            <span class="jv-value" id="jv-pitch-value">1.0</span>
+          </label>
+          <input type="range" id="jv-pitch" min="0.5" max="2" step="0.1" value="1" />
+        </div>
+        
+        <div class="jv-control">
+          <label class="jv-label">Voice</label>
+          <select id="jv-voice" class="jv-select"></select>
+        </div>
+        
+        <div class="jv-status" id="jv-status">
+          Ready
+        </div>
+      </div>
+    `;
+
+    // Inject into page
+    document.body.appendChild(this.panel);
+
+    // Setup event listeners
+    this.setupEventListeners();
+
+    // Load and populate voices
+    this.populateVoices();
+
+    // Load saved settings
+    this.loadSettings();
+
+    console.log('[Janitor Voice] UI Panel created');
+  }
+
+  /**
+   * Setup all event listeners
+   */
+  setupEventListeners() {
+    // Dragging
+    const header = this.panel.querySelector('#jv-drag-handle');
+    header.addEventListener('mousedown', (e) => this.startDrag(e));
+    document.addEventListener('mousemove', (e) => this.drag(e));
+    document.addEventListener('mouseup', () => this.stopDrag());
+
+    // Toggle
+    const toggle = this.panel.querySelector('#jv-toggle');
+    toggle.addEventListener('change', (e) => {
+      this.controller.setEnabled(e.target.checked);
+      this.updateStatus();
+    });
+
+    // Rate slider
+    const rate = this.panel.querySelector('#jv-rate');
+    const rateValue = this.panel.querySelector('#jv-rate-value');
+    rate.addEventListener('input', (e) => {
+      const value = parseFloat(e.target.value);
+      rateValue.textContent = value.toFixed(1) + 'x';
+      this.controller.setRate(value);
+    });
+
+    // Pitch slider
+    const pitch = this.panel.querySelector('#jv-pitch');
+    const pitchValue = this.panel.querySelector('#jv-pitch-value');
+    pitch.addEventListener('input', (e) => {
+      const value = parseFloat(e.target.value);
+      pitchValue.textContent = value.toFixed(1);
+      this.controller.setPitch(value);
+    });
+
+    // Voice selector
+    const voice = this.panel.querySelector('#jv-voice');
+    voice.addEventListener('change', (e) => {
+      this.controller.setVoice(e.target.value);
+    });
+
+    // Minimize button
+    const minimize = this.panel.querySelector('#jv-minimize');
+    minimize.addEventListener('click', () => this.toggleMinimize());
+
+    // Close button
+    const close = this.panel.querySelector('#jv-close');
+    close.addEventListener('click', () => this.hide());
+  }
+
+  /**
+   * Start dragging
+   */
+  startDrag(e) {
+    this.isDragging = true;
+    const rect = this.panel.getBoundingClientRect();
+    this.dragOffset.x = e.clientX - rect.left;
+    this.dragOffset.y = e.clientY - rect.top;
+    this.panel.style.cursor = 'grabbing';
+  }
+
+  /**
+   * Drag panel
+   */
+  drag(e) {
+    if (!this.isDragging) return;
+
+    e.preventDefault();
+
+    let x = e.clientX - this.dragOffset.x;
+    let y = e.clientY - this.dragOffset.y;
+
+    // Keep within viewport
+    const maxX = window.innerWidth - this.panel.offsetWidth;
+    const maxY = window.innerHeight - this.panel.offsetHeight;
+
+    x = Math.max(0, Math.min(x, maxX));
+    y = Math.max(0, Math.min(y, maxY));
+
+    this.panel.style.left = x + 'px';
+    this.panel.style.top = y + 'px';
+  }
+
+  /**
+   * Stop dragging
+   */
+  stopDrag() {
+    if (this.isDragging) {
+      this.isDragging = false;
+      this.panel.style.cursor = 'default';
+    }
+  }
+
+  /**
+   * Toggle minimize
+   */
+  toggleMinimize() {
+    this.isMinimized = !this.isMinimized;
+    const body = this.panel.querySelector('#jv-body');
+    const minimizeBtn = this.panel.querySelector('#jv-minimize');
+
+    if (this.isMinimized) {
+      body.style.display = 'none';
+      minimizeBtn.textContent = '+';
+      this.panel.classList.add('minimized');
+    } else {
+      body.style.display = 'block';
+      minimizeBtn.textContent = '−';
+      this.panel.classList.remove('minimized');
+    }
+  }
+
+  /**
+   * Populate voice dropdown
+   */
+  populateVoices() {
+    const select = this.panel.querySelector('#jv-voice');
+    const voices = this.controller.getVoices();
+
+    // Clear existing
+    select.innerHTML = '';
+
+    // Add default option
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = 'Default Voice';
+    select.appendChild(defaultOption);
+
+    // Add voices
+    voices.forEach(voice => {
+      const option = document.createElement('option');
+      option.value = voice.voiceURI;
+      option.textContent = `${voice.name} (${voice.lang})`;
+      select.appendChild(option);
+    });
+  }
+
+  /**
+   * Load settings into UI
+   */
+  loadSettings() {
+    const settings = this.controller.getSettings();
+
+    this.panel.querySelector('#jv-toggle').checked = settings.enabled;
+    this.panel.querySelector('#jv-rate').value = settings.rate;
+    this.panel.querySelector('#jv-rate-value').textContent = settings.rate.toFixed(1) + 'x';
+    this.panel.querySelector('#jv-pitch').value = settings.pitch;
+    this.panel.querySelector('#jv-pitch-value').textContent = settings.pitch.toFixed(1);
+
+    if (settings.voiceURI) {
+      this.panel.querySelector('#jv-voice').value = settings.voiceURI;
+    }
+
+    this.updateStatus();
+  }
+
+  /**
+   * Update status message
+   */
+  updateStatus(message = null) {
+    const status = this.panel.querySelector('#jv-status');
+
+    if (message) {
+      status.textContent = message;
+    } else {
+      const enabled = this.controller.getSettings().enabled;
+      status.textContent = enabled ? '✓ Voice Active' : 'Voice Disabled';
+      status.className = 'jv-status ' + (enabled ? 'active' : 'inactive');
+    }
+  }
+
+  /**
+   * Show panel
+   */
+  show() {
+    if (this.panel) {
+      this.panel.style.display = 'block';
+    }
+  }
+
+  /**
+   * Hide panel
+   */
+  hide() {
+    if (this.panel) {
+      this.panel.style.display = 'none';
+    }
+  }
+
+  /**
+   * Remove panel
+   */
+  destroy() {
+    if (this.panel) {
+      this.panel.remove();
+      this.panel = null;
+    }
+  }
+}
+
+// ============================================================================
+// VOICE CONTROLLER (Main Orchestrator)
+// ============================================================================
+
+/**
+ * Main voice controller
+ */
+class VoiceController {
+  constructor() {
+    this.ttsEngine = new WebSpeechTTS();
+    this.messageDetector = null;
+    this.uiPanel = null;
+    this.settings = CONFIG.DEFAULTS;
+    this.isInitialized = false;
+  }
+
+  /**
+   * Initialize the controller
+   */
+  async initialize() {
+    console.log('[Janitor Voice] Initializing...');
+
+    // Load settings
+    this.settings = StorageManager.loadSettings();
+
+    // Initialize TTS engine
+    await this.ttsEngine.initialize();
+
+    // Create UI panel
+    this.uiPanel = new UIPanel(this);
+    this.uiPanel.create();
+
+    // NEW: Create mic button injector
+    this.micButtonInjector = new MicButtonInjector((text, onEnd) => {
+      this.handleMicButtonPlay(text, onEnd);
+    });
+
+    // Setup message detector with mic button injection callback
+    this.messageDetector = new MessageDetector(
+      (text) => {
+        this.handleNewMessage(text);
+      },
+      (element, text) => {
+        // Inject mic button for each character message
+        this.micButtonInjector.injectButton(element, text);
+      }
+    );
+
+    // Setup visibility change handler
+    this.setupVisibilityHandler();
+
+    // Setup keyboard shortcut
+    this.setupKeyboardShortcut();
+
+    this.isInitialized = true;
+    console.log('[Janitor Voice] Initialized successfully');
+
+    // Start detecting if enabled
+    if (this.settings.enabled) {
+      this.startDetection();
+    }
+  }
+
+  /**
+   * Handle new character message
+   */
+  handleNewMessage(text) {
+    if (!this.settings.enabled) {
+      return;
+    }
+
+    // Speak the message
+    this.ttsEngine.speak(text, {
+      rate: this.settings.rate,
+      pitch: this.settings.pitch,
+      voiceURI: this.settings.voiceURI,
+      volume: this.settings.volume
+    });
+
+    // Update UI
+    if (this.uiPanel) {
+      this.uiPanel.updateStatus('🔊 Speaking...');
+      setTimeout(() => {
+        this.uiPanel.updateStatus();
+      }, 2000);
+    }
+  }
+
+  /**
+   * Start message detection
+   */
+  startDetection() {
+    if (this.messageDetector) {
+      this.messageDetector.start();
+    }
+  }
+
+  /**
+   * Stop message detection
+   */
+  stopDetection() {
+    if (this.messageDetector) {
+      this.messageDetector.stop();
+    }
+  }
+
+  /**
+   * Setup visibility change handler (pause when tab hidden)
+   */
+  setupVisibilityHandler() {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        this.ttsEngine.pause();
+      } else {
+        this.ttsEngine.resume();
+      }
+    });
+  }
+
+  /**
+   * Setup keyboard shortcut
+   */
+  setupKeyboardShortcut() {
+    document.addEventListener('keydown', (e) => {
+      // Ctrl+Shift+V (or Cmd+Shift+V on Mac)
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'V') {
+        e.preventDefault();
+        this.toggleEnabled();
+      }
+    });
+  }
+
+  /**
+   * Toggle enabled state
+   */
+  toggleEnabled() {
+    this.setEnabled(!this.settings.enabled);
+  }
+
+  /**
+   * Set enabled state
+   */
+  setEnabled(enabled) {
+    this.settings.enabled = enabled;
+    StorageManager.set('enabled', enabled);
+
+    if (enabled) {
+      this.startDetection();
+    } else {
+      this.stopDetection();
+      this.ttsEngine.stop();
+    }
+
+    if (this.uiPanel) {
+      this.uiPanel.loadSettings();
+    }
+
+    console.log('[Janitor Voice] Voice', enabled ? 'enabled' : 'disabled');
+  }
+
+  /**
+   * Set speech rate
+   */
+  setRate(rate) {
+    this.settings.rate = rate;
+    StorageManager.set('rate', rate);
+  }
+
+  /**
+   * Set pitch
+   */
+  setPitch(pitch) {
+    this.settings.pitch = pitch;
+    StorageManager.set('pitch', pitch);
+  }
+
+  /**
+   * Set voice
+   */
+  setVoice(voiceURI) {
+    this.settings.voiceURI = voiceURI || null;
+    StorageManager.set('voiceURI', voiceURI);
+  }
+
+  /**
+   * Get current settings
+   */
+  getSettings() {
+    return { ...this.settings };
+  }
+
+  /**
+   * Get available voices
+   */
+  getVoices() {
+    return this.ttsEngine.getVoices();
+  }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+/**
+ * Main initialization
+ */
+(async function init() {
+  // Wait for page to be ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+    return;
+  }
+
+  // Check if already initialized
+  if (window.janitorVoiceController) {
+    console.log('[Janitor Voice] Already initialized');
+    return;
+  }
+
+  // Create and initialize controller
+  const controller = new VoiceController();
+  await controller.initialize();
+
+  // Store globally for debugging
+  window.janitorVoiceController = controller;
+
+  console.log('[Janitor Voice] Loaded successfully');
+})();

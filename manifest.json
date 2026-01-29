@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Janitor Voice",
+  "version": "1.0.0",
+  "description": "Adds automatic Text-to-Speech voice to character messages on Janitor AI",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://janitorai.com/*",
+    "https://www.janitorai.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://janitorai.com/*",
+        "https://www.janitorai.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "commands": {
+    "toggle-voice": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+V",
+        "mac": "Command+Shift+V"
+      },
+      "description": "Toggle voice on/off"
+    }
+  }
+}
