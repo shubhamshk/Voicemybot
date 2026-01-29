@@ -537,3 +537,153 @@ select:focus-visible {
 .jv-mic-button:hover::before {
   opacity: 1;
 }
+
+/* ============================================================================
+   SETTINGS UI
+   ============================================================================ */
+
+.jv-tabs {
+  display: flex;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 8px;
+  padding: 4px;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.jv-tab {
+  flex: 1;
+  padding: 8px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 1px solid transparent;
+}
+
+.jv-tab:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+
+.jv-tab.active {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.jv-tab-content {
+  display: none;
+  animation: fadeIn 0.3s ease;
+}
+
+.jv-tab-content.active {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.jv-input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jv-input-wrapper {
+  display: flex;
+  gap: 8px;
+}
+
+.jv-input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  outline: none;
+}
+
+.jv-input:focus {
+  border-color: #667eea;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.jv-btn-save {
+  padding: 0 12px;
+  background: #667eea;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.jv-btn-save:hover {
+  background: #764ba2;
+}
+
+.jv-badge {
+  font-size: 9px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  font-weight: 700;
+  margin-left: 6px;
+}
+
+.jv-badge.free {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+}
+
+.jv-badge.premium {
+  background: linear-gradient(135deg, #f6d365, #fda085);
+  color: #5a3a00;
+}
+
+.jv-connection-status {
+  font-size: 10px;
+  margin-top: 4px;
+}
+
+.jv-connection-status.connected {
+  color: #10b981;
+}
+
+.jv-connection-status.error {
+  color: #ef4444;
+}
+
+.jv-provider-options {
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.jv-provider-section {
+  animation: fadeIn 0.3s ease;
+  padding: 4px 0;
+}

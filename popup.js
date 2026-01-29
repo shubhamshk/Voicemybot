@@ -37,4 +37,16 @@ document.addEventListener('DOMContentLoaded', () => {
             chrome.tabs.create({ url: link.href });
         });
     });
+
+    const showPanelBtn = document.getElementById('show-panel');
+    if (showPanelBtn) {
+        showPanelBtn.addEventListener('click', () => {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+                if (tabs[0]) {
+                    chrome.tabs.sendMessage(tabs[0].id, { action: 'SHOW_PANEL' });
+                    window.close(); // Close popup
+                }
+            });
+        });
+    }
 });

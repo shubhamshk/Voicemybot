@@ -20,33 +20,32 @@
 
 const CONFIG = {
   STORAGE_PREFIX: 'janitor_voice_',
+  PROVIDERS: {
+    WEB: 'web_speech',
+    ELEVEN: 'eleven_labs',
+    UNREAL: 'unreal_speech'
+  },
   DEFAULTS: {
     enabled: true,
     rate: 1.0,
     pitch: 1.0,
+    volume: 1.0,
     voiceURI: null,
-    volume: 1.0
+    provider: 'web_speech',
+    elevenLabsKey: '',
+    unrealKey: ''
   },
   SELECTORS: {
     chatContainer: '[data-testid="virtuoso-scroller"], [data-testid="virtuoso-item-list"], main',
     characterMessage: 'li._messageDisplayWrapper_2xqwb_2, li[class*="_messageDisplayWrapper_"]',
     userMessage: '[class*="user"]',
-    messageBody: '[class*="_messageBody_"]' // Specific selector for content
+    messageBody: '[class*="_messageBody_"]'
   },
   UI: {
     panelId: 'janitor-voice-panel',
-    overlayId: 'janitor-voice-overlay',
-    minWidth: 300,
-    minHeight: 200
-  },
-  SPEECH: {
-    queueDelay: 500
+    overlayId: 'janitor-voice-overlay'
   }
 };
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
 
 const StorageManager = {
   get(key, defaultValue = null) {
@@ -72,11 +71,88 @@ const StorageManager = {
       enabled: this.get('enabled', CONFIG.DEFAULTS.enabled),
       rate: this.get('rate', CONFIG.DEFAULTS.rate),
       pitch: this.get('pitch', CONFIG.DEFAULTS.pitch),
+      volume: this.get('volume', CONFIG.DEFAULTS.volume),
       voiceURI: this.get('voiceURI', CONFIG.DEFAULTS.voiceURI),
-      volume: this.get('volume', CONFIG.DEFAULTS.volume)
+      provider: this.get('provider', CONFIG.DEFAULTS.provider),
+      elevenLabsKey: this.get('elevenLabsKey', CONFIG.DEFAULTS.elevenLabsKey),
+      unrealKey: this.get('unrealKey', CONFIG.DEFAULTS.unrealKey)
     };
   }
 };
+
+// ============================================================================
+// TEXT CHUNKING UTILITY
+// ============================================================================
+
+/**
+ * Smart text splitter that respects sentence boundaries
+ * Splits text into chunks <= maxLength, preferring sentence endings
+ * @param {string} text - Text to split
+ * @param {number} maxLength - Maximum chunk length (default 900)
+ * @returns {string[]} Array of text chunks
+ */
+function smartSplit(text, maxLength = 900) {
+  if (!text || text.length <= maxLength) {
+    return [text];
+  }
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Find the best split point within maxLength
+    let chunk = remaining.substring(0, maxLength);
+    let splitIndex = -1;
+
+    // Try to split at sentence boundary (. ! ?)
+    const sentenceMatch = chunk.match(/[.!?]\s+(?=[A-Z])/g);
+    if (sentenceMatch) {
+      const lastSentence = chunk.lastIndexOf(sentenceMatch[sentenceMatch.length - 1]);
+      if (lastSentence > maxLength * 0.5) { // Don't split too early
+        splitIndex = lastSentence + sentenceMatch[sentenceMatch.length - 1].length;
+      }
+    }
+
+    // If no sentence boundary, try paragraph break
+    if (splitIndex === -1) {
+      splitIndex = chunk.lastIndexOf('\n\n');
+      if (splitIndex < maxLength * 0.5) splitIndex = -1;
+    }
+
+    // If no paragraph, try single newline
+    if (splitIndex === -1) {
+      splitIndex = chunk.lastIndexOf('\n');
+      if (splitIndex < maxLength * 0.5) splitIndex = -1;
+    }
+
+    // If no newline, try comma or semicolon
+    if (splitIndex === -1) {
+      const punctMatch = chunk.match(/[,;]\s/g);
+      if (punctMatch) {
+        const lastPunct = chunk.lastIndexOf(punctMatch[punctMatch.length - 1]);
+        if (lastPunct > maxLength * 0.5) {
+          splitIndex = lastPunct + punctMatch[punctMatch.length - 1].length;
+        }
+      }
+    }
+
+    // Last resort: split at last space
+    if (splitIndex === -1) {
+      splitIndex = chunk.lastIndexOf(' ');
+      if (splitIndex === -1) splitIndex = maxLength; // Force split if no space
+    }
+
+    chunks.push(remaining.substring(0, splitIndex).trim());
+    remaining = remaining.substring(splitIndex).trim();
+  }
+
+  return chunks.filter(c => c.length > 0);
+}
 
 // ============================================================================
 // TTS ENGINE
@@ -103,7 +179,7 @@ class WebSpeechTTS {
   }
 
   // Updated speak method with onBoundary support
-  speak(text, options = {}, onEnd, onBoundary) {
+  speak(text, options = {}, onEnd, onBoundary, onProgress) {
     this.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = options.rate || 1.0;
@@ -143,6 +219,286 @@ class WebSpeechTTS {
   pause() { this.synth.pause(); }
   resume() { this.synth.resume(); }
   isSpeaking() { return this.synth.speaking; }
+  getVoices() { return this.voices; }
+}
+
+class ElevenLabsTTS {
+  constructor() {
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    this.voices = [];
+    this.apiKey = null;
+    this.currentSource = null;
+  }
+
+  setApiKey(key) {
+    this.apiKey = key;
+    if (key) this.fetchVoices();
+  }
+
+  async fetchVoices() {
+    if (!this.apiKey) return;
+    try {
+      const resp = await fetch('https://api.elevenlabs.io/v1/voices', {
+        headers: { 'xi-api-key': this.apiKey }
+      });
+      const data = await resp.json();
+      if (data.voices) {
+        this.voices = data.voices.map(v => ({
+          name: v.name,
+          voiceURI: v.voice_id,
+          lang: 'en-US', // ElevenLabs is mostly English focused for basics
+          provider: 'eleven_labs'
+        }));
+      }
+    } catch (e) {
+      console.error('[Janitor Voice] EL Voices Error:', e);
+    }
+  }
+
+  async speak(text, options, onEnd, onProgress) {
+    this.cancel();
+    if (!this.apiKey) {
+      console.warn('[Janitor Voice] No ElevenLabs API Key');
+      if (onEnd) onEnd();
+      return;
+    }
+
+    try {
+      // Split text into chunks if needed
+      const chunks = smartSplit(text, 900);
+      const totalChunks = chunks.length;
+
+      console.log(`[Janitor Voice] ElevenLabs: Processing ${totalChunks} chunk(s)`);
+
+      // Process chunks sequentially
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkNum = i + 1;
+
+        // Update progress
+        if (onProgress && totalChunks > 1) {
+          onProgress(`Generating voice (${chunkNum}/${totalChunks})...`);
+        }
+
+        const voiceId = options.voiceURI || (this.voices[0] ? this.voices[0].voiceURI : '21m00Tcm4TlvDq8ikWAM');
+        const modelId = 'eleven_turbo_v2_5';
+
+        console.log(`[Janitor Voice] ElevenLabs: Generating chunk ${chunkNum}/${totalChunks}, length: ${chunk.length}`);
+
+        const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'xi-api-key': this.apiKey
+          },
+          body: JSON.stringify({
+            text: chunk,
+            model_id: modelId,
+            voice_settings: {
+              stability: 0.5,
+              similarity_boost: 0.75
+            }
+          })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('[Janitor Voice] ElevenLabs API Error:', {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorText
+          });
+          throw new Error(`ElevenLabs API Error (${response.status}): ${errorText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        console.log(`[Janitor Voice] ElevenLabs: Chunk ${chunkNum} audio received, size:`, arrayBuffer.byteLength);
+
+        // Update progress
+        if (onProgress && totalChunks > 1) {
+          onProgress(`Playing (${chunkNum}/${totalChunks})...`);
+        }
+
+        // Decode and play audio
+        const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+
+        // Play this chunk and wait for it to finish
+        await new Promise((resolve, reject) => {
+          this.currentSource = this.audioContext.createBufferSource();
+          this.currentSource.buffer = audioBuffer;
+          this.currentSource.playbackRate.value = options.rate || 1.0;
+          this.currentSource.connect(this.audioContext.destination);
+
+          this.currentSource.onended = () => {
+            this.currentSource = null;
+            resolve();
+          };
+
+          this.currentSource.onerror = (e) => {
+            console.error('[Janitor Voice] Audio playback error:', e);
+            reject(e);
+          };
+
+          this.currentSource.start(0);
+          console.log(`[Janitor Voice] ElevenLabs: Playing chunk ${chunkNum}/${totalChunks}`);
+        });
+      }
+
+      console.log('[Janitor Voice] ElevenLabs: All chunks completed');
+      if (onEnd) onEnd();
+
+    } catch (e) {
+      console.error('[Janitor Voice] ElevenLabs Speak Error:', e);
+      alert(`ElevenLabs Error: ${e.message}. Check console for details.`);
+      if (onEnd) onEnd();
+    }
+  }
+
+  cancel() {
+    if (this.currentSource) {
+      try {
+        this.currentSource.stop();
+      } catch (e) {
+        // Source may have already ended
+      }
+      this.currentSource = null;
+    }
+  }
+
+  getVoices() { return this.voices; }
+}
+
+class UnrealSpeechTTS {
+  constructor() {
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    this.apiKey = null;
+    this.currentSource = null;
+    // Hardcoded voices as Unreal Speech has a fixed set
+    this.voices = [
+      { name: 'Will (Male)', voiceURI: 'Will', provider: 'unreal_speech' },
+      { name: 'Scarlett (Female)', voiceURI: 'Scarlett', provider: 'unreal_speech' },
+      { name: 'Liv (Female)', voiceURI: 'Liv', provider: 'unreal_speech' },
+      { name: 'Amy (Female)', voiceURI: 'Amy', provider: 'unreal_speech' },
+      { name: 'Dan (Male)', voiceURI: 'Dan', provider: 'unreal_speech' }
+    ];
+  }
+
+  setApiKey(key) { this.apiKey = key; }
+
+  async speak(text, options, onEnd, onProgress) {
+    this.cancel();
+    if (!this.apiKey) {
+      console.warn('[Janitor Voice] No Unreal Speech API Key');
+      if (onEnd) onEnd();
+      return;
+    }
+
+    try {
+      // Split text into chunks if needed
+      const chunks = smartSplit(text, 900);
+      const totalChunks = chunks.length;
+
+      console.log(`[Janitor Voice] Unreal Speech: Processing ${totalChunks} chunk(s)`);
+
+      // Process chunks sequentially
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkNum = i + 1;
+
+        // Update progress
+        if (onProgress && totalChunks > 1) {
+          onProgress(`Generating voice (${chunkNum}/${totalChunks})...`);
+        }
+
+        const voiceId = options.voiceURI || 'Scarlett';
+
+        console.log(`[Janitor Voice] Unreal Speech: Generating chunk ${chunkNum}/${totalChunks}, length: ${chunk.length}`);
+
+        const response = await fetch('https://api.v6.unrealspeech.com/stream', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            Text: chunk,
+            VoiceId: voiceId,
+            Bitrate: '192k',
+            Speed: '0',
+            Pitch: '1.0',
+            Codec: 'libmp3lame'
+          })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('[Janitor Voice] Unreal Speech API Error:', {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorText
+          });
+          throw new Error(`Unreal Speech API Error (${response.status}): ${errorText}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        console.log(`[Janitor Voice] Unreal Speech: Chunk ${chunkNum} audio received, size:`, arrayBuffer.byteLength);
+
+        // Validate
+        if (arrayBuffer.byteLength === 0) {
+          throw new Error('Unreal Speech returned empty audio response');
+        }
+
+        // Update progress
+        if (onProgress && totalChunks > 1) {
+          onProgress(`Playing (${chunkNum}/${totalChunks})...`);
+        }
+
+        // Decode and play audio
+        const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+
+        // Play this chunk and wait for it to finish
+        await new Promise((resolve, reject) => {
+          this.currentSource = this.audioContext.createBufferSource();
+          this.currentSource.buffer = audioBuffer;
+          this.currentSource.playbackRate.value = options.rate || 1.0;
+          this.currentSource.connect(this.audioContext.destination);
+
+          this.currentSource.onended = () => {
+            this.currentSource = null;
+            resolve();
+          };
+
+          this.currentSource.onerror = (e) => {
+            console.error('[Janitor Voice] Audio playback error:', e);
+            reject(e);
+          };
+
+          this.currentSource.start(0);
+          console.log(`[Janitor Voice] Unreal Speech: Playing chunk ${chunkNum}/${totalChunks}`);
+        });
+      }
+
+      console.log('[Janitor Voice] Unreal Speech: All chunks completed');
+      if (onEnd) onEnd();
+
+    } catch (e) {
+      console.error('[Janitor Voice] Unreal Speech Error:', e);
+      alert(`Unreal Speech Error: ${e.message}. Check console for details.`);
+      if (onEnd) onEnd();
+    }
+  }
+
+  cancel() {
+    if (this.currentSource) {
+      try {
+        this.currentSource.stop();
+      } catch (e) {
+        // Source may have already ended
+      }
+      this.currentSource = null;
+    }
+  }
+
   getVoices() { return this.voices; }
 }
 
@@ -439,6 +795,7 @@ class UIPanel {
     this.panel = document.createElement('div');
     this.panel.id = CONFIG.UI.panelId;
     this.panel.className = 'janitor-voice-panel';
+    // Using tabs structure
     this.panel.innerHTML = `
       <div class="jv-header" id="jv-drag-handle">
         <div class="jv-title"><span class="jv-icon">🎤</span><span>Janitor Voice</span></div>
@@ -448,6 +805,7 @@ class UIPanel {
         </div>
       </div>
       <div class="jv-body" id="jv-body">
+        
         <div class="jv-control">
           <label class="jv-toggle-label">
             <input type="checkbox" id="jv-toggle" />
@@ -455,28 +813,141 @@ class UIPanel {
             <span class="jv-toggle-text">Enable Voice</span>
           </label>
         </div>
-        <div class="jv-control">
-          <label class="jv-label"><span>Speech Rate</span><span class="jv-value" id="jv-rate-value">1.0x</span></label>
-          <input type="range" id="jv-rate" min="0.5" max="2" step="0.1" value="1" />
+
+        <div class="jv-tabs">
+          <div class="jv-tab" data-provider="${CONFIG.PROVIDERS.WEB}">Free <span class="jv-badge free">Web</span></div>
+          <div class="jv-tab" data-provider="${CONFIG.PROVIDERS.ELEVEN}">11Labs <span class="jv-badge premium">Pro</span></div>
+          <div class="jv-tab" data-provider="${CONFIG.PROVIDERS.UNREAL}">Unreal <span class="jv-badge premium">Pro</span></div>
         </div>
-        <div class="jv-control">
-          <label class="jv-label"><span>Pitch</span><span class="jv-value" id="jv-pitch-value">1.0</span></label>
-          <input type="range" id="jv-pitch" min="0.5" max="2" step="0.1" value="1" />
+
+        <!-- SHARED VOICE CONTROLS (Rate/Pitch apply to most, but we'll show conditionally or always if supported) -->
+        <!-- Web Speech Settings -->
+        <div class="jv-provider-section" id="section-${CONFIG.PROVIDERS.WEB}">
+           <div class="jv-control">
+            <label class="jv-label"><span>Speed</span><span class="jv-value" id="jv-rate-value">1.0x</span></label>
+            <input type="range" id="jv-rate" min="0.5" max="2" step="0.1" value="1" />
+           </div>
+           <div class="jv-control">
+            <label class="jv-label"><span>Pitch</span><span class="jv-value" id="jv-pitch-value">1.0</span></label>
+            <input type="range" id="jv-pitch" min="0.5" max="2" step="0.1" value="1" />
+           </div>
         </div>
-        <div class="jv-control">
-          <label class="jv-label">Voice</label>
-          <select id="jv-voice" class="jv-select"></select>
+
+        <!-- ElevenLabs Settings -->
+        <div class="jv-provider-section" id="section-${CONFIG.PROVIDERS.ELEVEN}" style="display:none">
+          <div class="jv-input-group">
+            <label class="jv-label">API Key</label>
+            <div class="jv-input-wrapper">
+              <input type="password" id="jv-eleven-key" class="jv-input" placeholder="sk-..." />
+              <button class="jv-btn-save" id="jv-save-eleven">Save</button>
+            </div>
+            <div class="jv-connection-status" id="jv-status-eleven"></div>
+          </div>
+          <div class="jv-control" style="margin-top:8px;">
+            <label class="jv-label">Speed <span class="jv-value" id="jv-rate-eleven-val">1.0x</span></label>
+             <!-- Reusing the main rate slider event logic but physically separate inputs? 
+                  Alternatively, use one shared slider. Let's use shared logic but update description.
+                  For simplicity, let's reuse the Rate slider from the main section but move it out? 
+                  Actually, separate sections is cleaner for specific params. 
+                  But all engines support Rate. Let's duplicate or move the slider. 
+                  Let's just show the Shared controls for all, but pitch only for Web.
+              -->
+          </div>
         </div>
+
+        <!-- Unreal Speech Settings -->
+        <div class="jv-provider-section" id="section-${CONFIG.PROVIDERS.UNREAL}" style="display:none">
+          <div class="jv-input-group">
+            <label class="jv-label">API Key</label>
+            <div class="jv-input-wrapper">
+              <input type="password" id="jv-unreal-key" class="jv-input" placeholder="Bearer Token" />
+              <button class="jv-btn-save" id="jv-save-unreal">Save</button>
+            </div>
+            <div class="jv-connection-status" id="jv-status-unreal"></div>
+          </div>
+        </div>
+        
+        <!-- Shared Voice Select -->
+        <div class="jv-control">
+          <label class="jv-label">Voice Model</label>
+          <select id="jv-voice" class="jv-select"><option>Loading...</option></select>
+        </div>
+
         <div class="jv-status" id="jv-status">Ready</div>
       </div>
     `;
     document.body.appendChild(this.panel);
     this.setupEventListeners();
-    this.populateVoices();
     this.loadSettings();
   }
 
   setupEventListeners() {
+    this.setupDrag();
+
+    // Toggle
+    this.panel.querySelector('#jv-toggle').addEventListener('change', (e) => {
+      this.controller.setEnabled(e.target.checked);
+      this.updateStatus();
+    });
+
+    // Min/Close
+    this.panel.querySelector('#jv-minimize').addEventListener('click', () => {
+      this.isMinimized = !this.isMinimized;
+      this.panel.querySelector('#jv-body').style.display = this.isMinimized ? 'none' : 'flex';
+      this.panel.querySelector('#jv-minimize').textContent = this.isMinimized ? '+' : '−';
+    });
+    this.panel.querySelector('#jv-close').addEventListener('click', () => {
+      this.panel.style.display = 'none';
+      // Ideally this should disable the extension or just hide UI? 
+      // Just hide UI. Extension remains active in background.
+    });
+
+    // Rate / Pitch
+    const rateEl = this.panel.querySelector('#jv-rate');
+    rateEl.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      this.panel.querySelector('#jv-rate-value').textContent = val.toFixed(1) + 'x';
+      this.controller.setRate(val);
+    });
+    const pitchEl = this.panel.querySelector('#jv-pitch');
+    pitchEl.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      this.panel.querySelector('#jv-pitch-value').textContent = val.toFixed(1);
+      this.controller.setPitch(val);
+    });
+
+    // Voice Select
+    this.panel.querySelector('#jv-voice').addEventListener('change', (e) => {
+      this.controller.setVoice(e.target.value);
+    });
+
+    // API Keys
+    this.panel.querySelector('#jv-save-eleven').addEventListener('click', () => {
+      const val = this.panel.querySelector('#jv-eleven-key').value.trim();
+      this.controller.setElevenLabsKey(val);
+      this.updateKeyStatus('eleven', !!val);
+      // Refresh voices
+      this.populateVoices();
+    });
+    this.panel.querySelector('#jv-save-unreal').addEventListener('click', () => {
+      const val = this.panel.querySelector('#jv-unreal-key').value.trim();
+      this.controller.setUnrealKey(val);
+      this.updateKeyStatus('unreal', !!val);
+      // Refresh voices
+      this.populateVoices();
+    });
+
+    // Tabs
+    const tabs = this.panel.querySelectorAll('.jv-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        const provider = tab.dataset.provider;
+        this.switchProvider(provider);
+      });
+    });
+  }
+
+  setupDrag() {
     const header = this.panel.querySelector('#jv-drag-handle');
     header.addEventListener('mousedown', (e) => {
       this.isDragging = true;
@@ -496,60 +967,94 @@ class UIPanel {
       this.isDragging = false;
       this.panel.style.cursor = 'default';
     });
-
-    this.panel.querySelector('#jv-toggle').addEventListener('change', (e) => {
-      this.controller.setEnabled(e.target.checked);
-      this.updateStatus();
-    });
-    const rateEl = this.panel.querySelector('#jv-rate');
-    rateEl.addEventListener('input', (e) => {
-      const val = parseFloat(e.target.value);
-      this.panel.querySelector('#jv-rate-value').textContent = val.toFixed(1) + 'x';
-      this.controller.setRate(val);
-    });
-    const pitchEl = this.panel.querySelector('#jv-pitch');
-    pitchEl.addEventListener('input', (e) => {
-      const val = parseFloat(e.target.value);
-      this.panel.querySelector('#jv-pitch-value').textContent = val.toFixed(1);
-      this.controller.setPitch(val);
-    });
-    this.panel.querySelector('#jv-voice').addEventListener('change', (e) => {
-      this.controller.setVoice(e.target.value);
-    });
-    this.panel.querySelector('#jv-minimize').addEventListener('click', () => {
-      this.isMinimized = !this.isMinimized;
-      this.panel.querySelector('#jv-body').style.display = this.isMinimized ? 'none' : 'flex';
-      this.panel.querySelector('#jv-minimize').textContent = this.isMinimized ? '+' : '−';
-    });
-    this.panel.querySelector('#jv-close').addEventListener('click', () => {
-      this.panel.style.display = 'none';
-    });
   }
 
-  populateVoices() {
-    const select = this.panel.querySelector('#jv-voice');
-    const voices = this.controller.getVoices();
-    select.innerHTML = '';
-    const def = document.createElement('option');
-    def.value = ''; def.textContent = 'Default Voice';
-    select.appendChild(def);
-    voices.forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v.voiceURI;
-      opt.textContent = `${v.name} (${v.lang})`;
-      select.appendChild(opt);
+  switchProvider(provider) {
+    // Update active tab UI
+    this.panel.querySelectorAll('.jv-tab').forEach(t => {
+      if (t.dataset.provider === provider) t.classList.add('active');
+      else t.classList.remove('active');
     });
+
+    // Show/Hide sections
+    this.panel.querySelector(`#section-${CONFIG.PROVIDERS.WEB}`).style.display =
+      (provider === CONFIG.PROVIDERS.WEB) ? 'block' : 'none';
+
+    this.panel.querySelector(`#section-${CONFIG.PROVIDERS.ELEVEN}`).style.display =
+      (provider === CONFIG.PROVIDERS.ELEVEN) ? 'block' : 'none';
+
+    this.panel.querySelector(`#section-${CONFIG.PROVIDERS.UNREAL}`).style.display =
+      (provider === CONFIG.PROVIDERS.UNREAL) ? 'block' : 'none';
+
+    // Update Controller
+    this.controller.setProvider(provider);
+
+    // Refresh Voices
+    this.populateVoices();
+  }
+
+  async populateVoices() {
+    const select = this.panel.querySelector('#jv-voice');
+    select.innerHTML = '<option>Loading voices...</option>';
+    select.disabled = true;
+
+    try {
+      const voices = await this.controller.getVoices();
+      select.innerHTML = '';
+      select.disabled = false;
+
+      if (voices.length === 0) {
+        const opt = document.createElement('option');
+        opt.textContent = 'No voices found (Check API Key)';
+        select.appendChild(opt);
+        return;
+      }
+
+      voices.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v.voiceURI;
+        opt.textContent = `${v.name}`;
+        select.appendChild(opt);
+      });
+
+      // Set selected
+      const current = this.controller.getSettings().voiceURI;
+      if (current) select.value = current;
+
+    } catch (e) {
+      console.error(e);
+      select.innerHTML = '<option>Error loading voices</option>';
+    }
   }
 
   loadSettings() {
-    const settings = this.controller.getSettings();
-    this.panel.querySelector('#jv-toggle').checked = settings.enabled;
-    this.panel.querySelector('#jv-rate').value = settings.rate;
-    this.panel.querySelector('#jv-rate-value').textContent = settings.rate.toFixed(1) + 'x';
-    this.panel.querySelector('#jv-pitch').value = settings.pitch;
-    this.panel.querySelector('#jv-pitch-value').textContent = settings.pitch.toFixed(1);
-    if (settings.voiceURI) this.panel.querySelector('#jv-voice').value = settings.voiceURI;
+    const s = this.controller.getSettings();
+    this.panel.querySelector('#jv-toggle').checked = s.enabled;
+    this.panel.querySelector('#jv-rate').value = s.rate;
+    this.panel.querySelector('#jv-rate-value').textContent = s.rate.toFixed(1) + 'x';
+    this.panel.querySelector('#jv-pitch').value = s.pitch;
+    this.panel.querySelector('#jv-pitch-value').textContent = s.pitch.toFixed(1);
+
+    this.panel.querySelector('#jv-eleven-key').value = s.elevenLabsKey || '';
+    this.panel.querySelector('#jv-unreal-key').value = s.unrealKey || '';
+
+    this.updateKeyStatus('eleven', !!s.elevenLabsKey);
+    this.updateKeyStatus('unreal', !!s.unrealKey);
+
+    // Initial provider switch
+    this.switchProvider(s.provider || CONFIG.PROVIDERS.WEB);
     this.updateStatus();
+  }
+
+  updateKeyStatus(provider, hasKey) {
+    const status = this.panel.querySelector(`#jv-status-${provider}`);
+    if (hasKey) {
+      status.textContent = '✓ Key Saved';
+      status.className = 'jv-connection-status connected';
+    } else {
+      status.textContent = '⚠ No API Key';
+      status.className = 'jv-connection-status error';
+    }
   }
 
   updateStatus(msg) {
@@ -560,6 +1065,10 @@ class UIPanel {
       status.textContent = enabled ? '✓ Voice Active' : 'Voice Disabled';
       status.className = 'jv-status ' + (enabled ? 'active' : 'inactive');
     }
+  }
+
+  show() {
+    this.panel.style.display = 'block';
   }
 }
 
@@ -609,7 +1118,12 @@ class MessageDetector {
 
 class VoiceController {
   constructor() {
-    this.tts = new WebSpeechTTS();
+    this.engines = {
+      [CONFIG.PROVIDERS.WEB]: new WebSpeechTTS(),
+      [CONFIG.PROVIDERS.ELEVEN]: new ElevenLabsTTS(),
+      [CONFIG.PROVIDERS.UNREAL]: new UnrealSpeechTTS()
+    };
+
     this.overlay = new OverlayManager();
     this.uiPanel = null;
     this.injector = null;
@@ -622,7 +1136,12 @@ class VoiceController {
   }
 
   async init() {
-    await this.tts.initialize();
+    await this.engines[CONFIG.PROVIDERS.WEB].initialize();
+
+    // Initialize keys
+    this.engines[CONFIG.PROVIDERS.ELEVEN].setApiKey(this.settings.elevenLabsKey);
+    this.engines[CONFIG.PROVIDERS.UNREAL].setApiKey(this.settings.unrealKey);
+
     this.overlay.create();
     this.uiPanel = new UIPanel(this);
     this.uiPanel.create();
@@ -638,25 +1157,52 @@ class VoiceController {
     });
     this.detector.start();
 
-    document.addEventListener('visibilitychange', () => {
-      if (this.playbackState === 'PLAYING' && document.hidden) {
-        this.tts.pause();
-      } else if (this.playbackState === 'PLAYING' && !document.hidden) {
-        this.tts.resume();
+    // Listener for popup messages
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+      if (request.action === 'SHOW_PANEL') {
+        this.uiPanel.show();
       }
     });
 
-    console.log('[Janitor Voice] v3.4 Initialized + Debug Stats');
+    // Use visibility change to pause/resume
+    document.addEventListener('visibilitychange', () => {
+      if (this.playbackState === 'PLAYING') {
+        const engine = this.getActiveEngine();
+        if (engine && typeof engine.pause === 'function') {
+          if (document.hidden) engine.pause();
+          else engine.resume();
+        }
+      }
+    });
+
+    console.log('[Janitor Voice] v4.0 Multi-Provider Initialized');
+  }
+
+  getActiveEngine() {
+    return this.engines[this.settings.provider] || this.engines[CONFIG.PROVIDERS.WEB];
   }
 
   handleInteraction(element, text, button) {
     if (this.currentButton === button) {
       if (this.playbackState === 'PLAYING') {
-        this.tts.pause();
-        this.setPlaybackState(button, 'PAUSED');
+        // Not all engines support pause, but we try
+        const engine = this.getActiveEngine();
+        if (engine.pause) {
+          engine.pause();
+          this.setPlaybackState(button, 'PAUSED');
+        } else {
+          // If pause not supported, just stop
+          this.stop();
+        }
       } else if (this.playbackState === 'PAUSED') {
-        this.tts.resume();
-        this.setPlaybackState(button, 'PLAYING');
+        const engine = this.getActiveEngine();
+        if (engine.resume) {
+          engine.resume();
+          this.setPlaybackState(button, 'PLAYING');
+        } else {
+          // Replay if resume not supported
+          this.play(element, text, button);
+        }
       } else {
         this.play(element, text, button);
       }
@@ -664,22 +1210,40 @@ class VoiceController {
     }
 
     if (this.currentButton) {
-      this.injector.setButtonState(this.currentButton, 'idle');
-      this.tts.cancel();
-      this.highlighter.stop();
+      this.stop();
     }
 
     this.play(element, text, button);
   }
 
-  play(element, text, button) {
-    this.currentButton = button;
-    this.setPlaybackState(button, 'PLAYING');
+  stop() {
+    Object.values(this.engines).forEach(e => e.cancel());
+    this.highlighter.stop();
+    if (this.currentButton) {
+      this.injector.setButtonState(this.currentButton, 'idle');
+      this.currentButton = null;
+    }
+    this.playbackState = 'IDLE';
+    this.uiPanel.updateStatus();
+  }
 
-    // START HIGHLIGHTING
+  play(element, text, button) {
+    this.stop(); // Ensure everything is stopped first
+
+    this.currentButton = button;
+    this.setPlaybackState(button, 'PLAYING'); // Optimistic state
+
+    // START HIGHLIGHTING (Only works well with WebSpeech boundary events usually, but we try)
     this.highlighter.start(element, text);
 
-    this.tts.speak(text, {
+    const engine = this.getActiveEngine();
+
+    // Show loading if async (Eleven/Unreal)
+    if (this.settings.provider !== CONFIG.PROVIDERS.WEB) {
+      this.injector.setButtonState(button, 'loading');
+    }
+
+    engine.speak(text, {
       rate: this.settings.rate,
       pitch: this.settings.pitch,
       volume: this.settings.volume,
@@ -689,21 +1253,35 @@ class VoiceController {
       () => {
         console.log('[Janitor Voice] Playback Ended');
         if (this.currentButton === button) {
-          this.injector.setButtonState(button, 'idle');
-          this.currentButton = null;
-          this.playbackState = 'IDLE';
-          this.uiPanel.updateStatus();
-          this.highlighter.stop();
+          this.stop();
         }
       },
-      // onBoundary
+      // onBoundary (Web Speech only mainly)
       (event) => {
-        // Debug
-        // console.log('Boundary:', event.name, event.charIndex);
         if (event.name === 'word') {
           this.highlighter.highlight(event.charIndex);
         }
-      });
+      },
+      // onProgress (Premium providers with chunking)
+      (progressMsg) => {
+        console.log('[Janitor Voice] Progress:', progressMsg);
+        this.uiPanel.updateStatus(progressMsg);
+        // Update button label for visual feedback
+        const labelEl = button.querySelector('.jv-btn-label');
+        if (labelEl) {
+          labelEl.textContent = progressMsg;
+        }
+      }
+    );
+
+    // If provider is not web speech, remove loading state when it likely starts
+    if (this.settings.provider !== CONFIG.PROVIDERS.WEB) {
+      setTimeout(() => {
+        if (this.currentButton === button && this.playbackState === 'PLAYING') {
+          this.injector.setButtonState(button, 'playing');
+        }
+      }, 1000);
+    }
   }
 
   setPlaybackState(button, state) {
@@ -724,22 +1302,48 @@ class VoiceController {
   setEnabled(enabled) {
     this.settings.enabled = enabled;
     StorageManager.set('enabled', enabled);
-    if (!enabled) {
-      this.tts.cancel();
-      this.currentButton = null;
-      this.playbackState = 'IDLE';
-      this.highlighter.stop();
-      if (this.injector) this.injector.stop();
-    } else {
-      if (this.injector) this.injector.startTracking();
-      if (this.detector) this.detector.scan(document.body);
-    }
+    if (!enabled) this.stop();
   }
   setRate(rate) { this.settings.rate = rate; StorageManager.set('rate', rate); }
   setPitch(pitch) { this.settings.pitch = pitch; StorageManager.set('pitch', pitch); }
-  setVoice(voiceURI) { this.settings.voiceURI = voiceURI; StorageManager.set('voiceURI', voiceURI); }
+  setVolume(vol) { this.settings.volume = vol; StorageManager.set('volume', vol); }
+
+  setProvider(provider) {
+    this.settings.provider = provider;
+    StorageManager.set('provider', provider);
+    // Reset voice URI when switching providers to default of that provider
+    this.settings.voiceURI = '';
+    this.stop();
+  }
+
+  setElevenLabsKey(key) {
+    this.settings.elevenLabsKey = key;
+    StorageManager.set('elevenLabsKey', key);
+    this.engines[CONFIG.PROVIDERS.ELEVEN].setApiKey(key);
+  }
+
+  setUnrealKey(key) {
+    this.settings.unrealKey = key;
+    StorageManager.set('unrealKey', key);
+    this.engines[CONFIG.PROVIDERS.UNREAL].setApiKey(key);
+  }
+
+  setVoice(voiceURI) {
+    this.settings.voiceURI = voiceURI;
+    StorageManager.set('voiceURI', voiceURI);
+  }
+
   getSettings() { return this.settings; }
-  getVoices() { return this.tts.getVoices(); }
+
+  async getVoices() {
+    // Return voices for current provider
+    const engine = this.getActiveEngine();
+    // If it's an async fetch (ElevenLabs), ensure we try to fetch if empty
+    if (engine instanceof ElevenLabsTTS && engine.voices.length === 0) {
+      await engine.fetchVoices();
+    }
+    return engine.getVoices();
+  }
 }
 
 if (!window.janitorVoiceLoaded) {
